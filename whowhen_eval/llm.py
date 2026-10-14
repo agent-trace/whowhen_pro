@@ -46,6 +46,8 @@ def generate(
     temperature: float = 0.0,
     max_tokens: int = 2048,
     reasoning_effort: Optional[str] = None,
+    api_base: Optional[str] = None,
+    api_key: Optional[str] = None,
     timeout: int = 600,
     num_retries: int = 5,
 ) -> tuple[str, dict[str, Optional[int]]]:
@@ -70,6 +72,10 @@ def generate(
     kwargs: dict[str, Any] = {}
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
+    if api_base is not None:
+        kwargs["api_base"] = api_base
+    if api_key is not None:
+        kwargs["api_key"] = api_key
 
     response = litellm.completion(
         model=model,
