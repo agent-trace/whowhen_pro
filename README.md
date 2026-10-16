@@ -85,6 +85,10 @@ python -m whowhen_eval.run --model gpt-5.4 --data-root ./whowhen-pro \
 
 🔄 **Runs are resumable.** Results append to `<out>/<model>/<benchmark>.jsonl`. If you interrupt a sweep, just re-run the same command and it picks up where it left off.
 
+### PostgreSQL-backed DAG Backtrace
+
+The separate [DAG Backtrace runner](docs/dag-backtrace-pg.md) reads the lossless text trajectories from PostgreSQL, constructs semantic dependency graphs, and follows them backwards to attribute failures. Preview the PG adapter and label-safety checks without model calls with `python -m whowhen_eval.run_dag_pg --model <model> --canonical-snapshot <labels.jsonl> --pg-dsn <dsn> --max-traces 3 --dry-run`.
+
 ## 📈 Check the Metrics
 
 ```bash

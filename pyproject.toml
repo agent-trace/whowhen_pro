@@ -28,6 +28,7 @@ dependencies = [
 [project.scripts]
 whowhen-eval = "whowhen_eval.run:main"
 whowhen-leaderboard = "whowhen_eval.leaderboard:main"
+whowhen-eval-dag-pg = "whowhen_eval.run_dag_pg:main"
 
 [tool.setuptools.packages.find]
 include = ["whowhen_eval*"]
