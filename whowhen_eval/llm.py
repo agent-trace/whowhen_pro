@@ -44,14 +44,17 @@ def generate(
     messages: list[dict[str, Any]],
     *,
     temperature: float = 0.0,
-    max_tokens: int = 2048,
+    max_tokens: Optional[int] = 2048,
     reasoning_effort: Optional[str] = None,
     api_base: Optional[str] = None,
     api_key: Optional[str] = None,
     timeout: int = 600,
     num_retries: int = 5,
-) -> tuple[str, dict[str, Optional[int]]]:
-    """Run one completion and return ``(text, usage)``.
+) -> tuple[str, dict[str, Any]]:
+    """Run one completion and return (text, usage).
+
+    When max_tokens is None, omit the parameter so the provider
+    applies its own output limit.
 
     ``reasoning_effort`` is forwarded only when the caller sets it, so
     non-reasoning models never see the parameter at all.
@@ -70,6 +73,8 @@ def generate(
     them per-trace so one bad row can't kill a sweep.
     """
     kwargs: dict[str, Any] = {}
+    if max_tokens is not None:
+        kwargs["max_tokens"] = max_tokens
     if reasoning_effort is not None:
         kwargs["reasoning_effort"] = reasoning_effort
     if api_base is not None:
@@ -81,7 +86,6 @@ def generate(
         model=model,
         messages=messages,
         temperature=temperature,
-        max_tokens=max_tokens,
         timeout=timeout,
         max_retries=num_retries,
         drop_params=True,
@@ -112,30 +116,44 @@ def text_of(response: Any) -> str:
     return getattr(message, "content", None) or ""
 
 
-def usage_of(response: Any) -> dict[str, Optional[int]]:
-    """Normalise ``response.usage`` to input/output/total token counts.
+def _field(obj: Any, name: str) -> Any:
+    if isinstance(obj, dict):
+        return obj.get(name)
+    return getattr(obj, name, None)
 
-    Every field degrades to ``None`` when the provider omits usage
+
+def usage_of(response: Any) -> dict[str, Any]:
+    """Normalise token usage and response diagnostics from a completion.
+
+    Every field degrades to None when the provider omits usage
     reporting, so downstream cost analysis can tell "zero tokens" apart
-    from "not reported".
+    from "not reported". finish_reason is recorded when available;
+    reasoning_tokens is read from completion token details.
     """
-    usage = getattr(response, "usage", None)
-    if usage is None:
-        return {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+    usage = _field(response, "usage")
+    choice_list = _field(response, "choices") or []
+    choice = choice_list[0] if choice_list else None
 
-    in_tok = getattr(usage, "prompt_tokens", None)
+    in_tok = _field(usage, "prompt_tokens")
     if in_tok is None:
-        in_tok = getattr(usage, "input_tokens", None)
-    out_tok = getattr(usage, "completion_tokens", None)
+        in_tok = _field(usage, "input_tokens")
+    out_tok = _field(usage, "completion_tokens")
     if out_tok is None:
-        out_tok = getattr(usage, "output_tokens", None)
+        out_tok = _field(usage, "output_tokens")
 
     total: Optional[int] = None
     if in_tok is not None or out_tok is not None:
         total = (in_tok or 0) + (out_tok or 0)
 
+    completion_details = _field(usage, "completion_tokens_details")
+    reasoning_tokens = _field(completion_details, "reasoning_tokens")
+    if reasoning_tokens is None:
+        reasoning_tokens = _field(usage, "reasoning_tokens")
+
     return {
         "input_tokens": int(in_tok) if in_tok is not None else None,
         "output_tokens": int(out_tok) if out_tok is not None else None,
         "total_tokens": total,
+        "reasoning_tokens": int(reasoning_tokens) if reasoning_tokens is not None else None,
+        "finish_reason": _field(choice, "finish_reason"),
     }

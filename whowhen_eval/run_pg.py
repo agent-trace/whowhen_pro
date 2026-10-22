@@ -26,7 +26,10 @@ from .prompts import load_taxonomy, user_msg
 from .store import ResultsStore
 
 
-_NO_USAGE = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+_NO_USAGE = {
+    "input_tokens": None, "output_tokens": None, "total_tokens": None,
+    "reasoning_tokens": None, "finish_reason": None,
+}
 
 
 def load_snapshot(path: Path) -> list[dict[str, Any]]:
@@ -81,6 +84,9 @@ async def evaluate_one(*, api_sem: asyncio.Semaphore, db_sem: asyncio.Semaphore,
         "method": args.method,
         "model": args.model,
         "trace_id": trace_id,
+        "max_tokens": args.max_tokens,
+        "finish_reason": None,
+        "reasoning_tokens": None,
         "framework": record.get("framework"),
         "benchmark": record.get("benchmark"),
         "modality": record.get("split"),
@@ -146,7 +152,126 @@ async def evaluate_one(*, api_sem: asyncio.Semaphore, db_sem: asyncio.Semaphore,
         }
     return {**base, "raw_output": raw, "prediction": prediction,
             "score": score_canonical(prediction, record), "usage": usage,
+            "finish_reason": usage.get("finish_reason"),
+            "reasoning_tokens": usage.get("reasoning_tokens"),
             "duration_s": duration, "prompt": prompt_info, "error": error}
+
+
+
+def _write_run_state(out: Path, state: dict[str, Any]) -> None:
+    out.mkdir(parents=True, exist_ok=True)
+    target = out / "run-state.json"
+    temporary = target.with_suffix(".json.tmp")
+    state["updated_at"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    temporary.write_text(json.dumps(state, ensure_ascii=False, indent=2) + "\n",
+                         encoding="utf-8")
+    os.replace(temporary, target)
+
+
+def _append_pause_event(out: Path, result: dict[str, Any],
+                        api_key: Optional[str]) -> dict[str, Any]:
+    error = str(result.get("error") or "unknown error")
+    if api_key:
+        error = error.replace(api_key, "[REDACTED]")
+    event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "trace_id": result.get("trace_id"),
+        "benchmark": result.get("benchmark"),
+        "phase": "postgresql" if error.startswith("pg_bundle:") else "api_or_runner",
+        "error": error,
+    }
+    out.mkdir(parents=True, exist_ok=True)
+    with (out / "pause-events.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(event, ensure_ascii=False) + "\n")
+        handle.flush()
+    return event
+
+
+async def _process_pending(records: list[dict[str, Any]],
+                           stores: dict[str, ResultsStore], *,
+                           api_sem: asyncio.Semaphore,
+                           db_sem: asyncio.Semaphore,
+                           repository: PostgresTraceRepository,
+                           taxonomy,
+                           api_key: Optional[str],
+                           args: argparse.Namespace,
+                           state: dict[str, Any]) -> tuple[int, int, int, bool]:
+    """Process a bounded worker queue; optionally stop scheduling after any error."""
+    queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    for record in records:
+        queue.put_nowait(record)
+    stop = asyncio.Event()
+    attempted = succeeded = failed = 0
+    initial_attempted = int(state.get("attempted_this_run", 0))
+    initial_failed = int(state.get("failed_attempts_this_run", 0))
+    initial_completed = int(state.get("completed_traces", 0))
+    progress_every = max(1, len(records) // 20) if records else 1
+    started = time.monotonic()
+
+    def update_state(status: str) -> None:
+        state["status"] = status
+        state["attempted_this_run"] = initial_attempted + attempted
+        state["failed_attempts_this_run"] = initial_failed + failed
+        state["completed_traces"] = initial_completed + succeeded
+        state["remaining_traces"] = max(
+            int(state.get("total_traces", 0)) - state["completed_traces"], 0
+        )
+        if state["remaining_traces"] == 0 and state["failed_attempts_this_run"] == 0:
+            state["status"] = "complete"
+        _write_run_state(args.out, state)
+
+    async def worker() -> None:
+        nonlocal attempted, succeeded, failed
+        while not stop.is_set():
+            try:
+                record = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            try:
+                result = await evaluate_one(
+                    api_sem=api_sem, db_sem=db_sem, repository=repository,
+                    record=record, taxonomy=taxonomy, api_key=api_key, args=args,
+                )
+            except Exception as exc:  # noqa: BLE001 - keep a checkpoint on unexpected faults
+                result = {
+                    "trace_id": record.get("trace_id"),
+                    "benchmark": record.get("benchmark"),
+                    "error": f"runner: {type(exc).__name__}: {exc}",
+                }
+
+            attempted += 1
+            if result.get("error"):
+                failed += 1
+                if args.pause_on_error:
+                    event = _append_pause_event(args.out, result, api_key)
+                    state["last_error"] = event
+                    stop.set()
+                elif not args.dry_run:
+                    stores[result["benchmark"]].append(result)
+            else:
+                succeeded += 1
+                if not args.dry_run:
+                    stores[result["benchmark"]].append(result)
+
+            if attempted % progress_every == 0 or attempted == len(records) or stop.is_set():
+                elapsed = time.monotonic() - started
+                rate = attempted / elapsed if elapsed else 0.0
+                print(
+                    f"[progress] {attempted}/{len(records)} attempted "
+                    f"succeeded={succeeded} failed={failed} queued={queue.qsize()} "
+                    f"{rate:.2f}/s",
+                    file=sys.stderr,
+                )
+                update_state("paused" if stop.is_set() else "running")
+            queue.task_done()
+
+    workers = [asyncio.create_task(worker())
+               for _ in range(min(max(1, args.concurrency), len(records)))]
+    if workers:
+        await asyncio.gather(*workers)
+    paused = stop.is_set()
+    update_state("paused" if paused else "running")
+    return attempted, succeeded, failed, paused
 
 
 async def run(args: argparse.Namespace) -> int:
@@ -181,51 +306,61 @@ async def run(args: argparse.Namespace) -> int:
 
         pending_by_benchmark[benchmark] = pending
 
+    total_records = sum(len(records) for records in by_benchmark.values())
+    run_state: dict[str, Any] = {
+        "status": "running",
+        "model": args.model,
+        "method": args.method,
+        "modality": args.modality,
+        "api_base": args.api_base,
+        "snapshot": str(args.canonical_snapshot),
+        "output_dir": str(args.out),
+        "started_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "total_traces": total_records,
+        "completed_traces": total_skipped,
+        "remaining_traces": max(total_records - total_skipped, 0),
+        "attempted_this_run": 0,
+        "failed_attempts_this_run": 0,
+        "last_error": None,
+    }
+    _write_run_state(args.out, run_state)
+    total_succeeded = 0
+    paused = False
+
     if args.schedule_scope == "global":
         pending_records = [
             record for pending in pending_by_benchmark.values() for record in pending
         ]
-        started = time.monotonic()
-        failed = 0
-        coroutines = [
-            evaluate_one(api_sem=api_sem, db_sem=db_sem, repository=repository,
-                         record=record, taxonomy=taxonomy, api_key=api_key, args=args)
-            for record in pending_records
-        ]
-        for index, future in enumerate(asyncio.as_completed(coroutines), 1):
-            result = await future
-            if result.get("error"):
-                failed += 1
-            if not args.dry_run:
-                stores[result["benchmark"]].append(result)
-            if index % max(1, len(pending_records) // 20) == 0 or index == len(pending_records):
-                elapsed = time.monotonic() - started
-                rate = index / elapsed if elapsed else 0.0
-                print(f"[global] {index}/{len(pending_records)} failed={failed} {rate:.2f}/s", file=sys.stderr)
-        total_done += len(pending_records)
+        attempted, succeeded, failed, paused = await _process_pending(
+            pending_records, stores, api_sem=api_sem, db_sem=db_sem,
+            repository=repository, taxonomy=taxonomy, api_key=api_key,
+            args=args, state=run_state,
+        )
+        total_done += attempted
+        total_succeeded += succeeded
         total_failed += failed
     else:
         for benchmark, pending in pending_by_benchmark.items():
-            store = stores[benchmark]
-            started = time.monotonic()
-            failed = 0
-            coroutines = [evaluate_one(api_sem=api_sem, db_sem=db_sem, repository=repository,
-                                       record=record, taxonomy=taxonomy, api_key=api_key, args=args)
-                          for record in pending]
-            for index, future in enumerate(asyncio.as_completed(coroutines), 1):
-                result = await future
-                if result.get("error"):
-                    failed += 1
-                if not args.dry_run:
-                    store.append(result)
-                if index % max(1, len(pending) // 20) == 0 or index == len(pending):
-                    elapsed = time.monotonic() - started
-                    rate = index / elapsed if elapsed else 0.0
-                    print(f"  [{benchmark}] {index}/{len(pending)} failed={failed} {rate:.2f}/s", file=sys.stderr)
-            total_done += len(pending)
+            attempted, succeeded, failed, paused = await _process_pending(
+                pending, stores, api_sem=api_sem, db_sem=db_sem,
+                repository=repository, taxonomy=taxonomy, api_key=api_key,
+                args=args, state=run_state,
+            )
+            total_done += attempted
+            total_succeeded += succeeded
             total_failed += failed
-    print(f"canonical-PG summary: done={total_done}, skipped={total_skipped}, failed={total_failed}", file=sys.stderr)
-    return 0 if total_failed == 0 else 2
+            if paused:
+                break
+
+    if paused:
+        run_state["status"] = "paused"
+    elif run_state["remaining_traces"] == 0 and total_failed == 0:
+        run_state["status"] = "complete"
+    else:
+        run_state["status"] = "partial"
+    _write_run_state(args.out, run_state)
+    print(f"canonical-PG summary: done={total_done}, skipped={total_skipped}, failed={total_failed}, status={run_state['status']}", file=sys.stderr)
+    return 3 if paused else (0 if total_failed == 0 else 2)
 
 
 def build_argparser() -> argparse.ArgumentParser:
@@ -255,6 +390,8 @@ def build_argparser() -> argparse.ArgumentParser:
                         help="Schedule each benchmark in sequence (default) or share one pool globally")
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--max-tokens", type=int, default=2048)
+    parser.add_argument("--no-max-tokens", dest="max_tokens", action="store_const", const=None,
+                        help="Omit max_tokens so the provider chooses its own output limit")
     parser.add_argument("--reasoning-effort", default=None)
     parser.add_argument("--prompt-max-chars", type=int, default=None,
                         help="Optional explicit prompt cap; omitted means no prompt truncation")
@@ -262,6 +399,8 @@ def build_argparser() -> argparse.ArgumentParser:
     parser.add_argument("--max-traces", type=int, default=None)
     parser.add_argument("--no-resume", dest="resume", action="store_false")
     parser.set_defaults(resume=True)
+    parser.add_argument("--pause-on-error", action="store_true",
+                        help="stop scheduling new traces on the first trace-level error; failed trace is left retryable on resume")
     parser.add_argument("--dry-run", action="store_true")
     return parser
 

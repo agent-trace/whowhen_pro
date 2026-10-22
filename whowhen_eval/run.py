@@ -304,7 +304,10 @@ def build_prompt(release: dict, framework: str,
     )
 
 
-_NO_USAGE = {"input_tokens": None, "output_tokens": None, "total_tokens": None}
+_NO_USAGE = {
+    "input_tokens": None, "output_tokens": None, "total_tokens": None,
+    "reasoning_tokens": None, "finish_reason": None,
+}
 
 
 async def evaluate_one(

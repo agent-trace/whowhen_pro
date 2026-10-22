@@ -10,7 +10,7 @@ from unittest.mock import patch
 from whowhen_eval.canonical import canonical_prompt, parse_canonical, score_canonical
 from whowhen_eval.pg_source import trace_bundle_from_rows
 from whowhen_eval.prompts import Taxonomy
-from whowhen_eval.run_pg import evaluate_one, select_records
+from whowhen_eval.run_pg import build_argparser, evaluate_one, select_records
 
 
 TAXONOMY = Taxonomy(codes=("A.1", "R.2"), block="- A.1: **Mode A**\n- R.2: **Mode R**")
@@ -134,6 +134,16 @@ class CanonicalPgProtocolTests(unittest.TestCase):
             ]
             self.assertEqual(select_records(records, args), {"b": [records[1]]})
 
+    def test_no_max_tokens_flag_omits_output_limit(self):
+        parser = build_argparser()
+        required = [
+            "--model", "test/model",
+            "--canonical-snapshot", "snapshot.jsonl",
+            "--taxonomy-path", "taxonomy.yaml",
+        ]
+        self.assertEqual(parser.parse_args(required).max_tokens, 2048)
+        self.assertIsNone(parser.parse_args(required + ["--no-max-tokens"]).max_tokens)
+
 
 class CanonicalPgTimingTests(unittest.IsolatedAsyncioTestCase):
     async def test_request_duration_excludes_api_semaphore_queue_wait(self):
@@ -158,7 +168,8 @@ class CanonicalPgTimingTests(unittest.IsolatedAsyncioTestCase):
                 time.sleep(0.02)
             return (
                 "Actor: planner\nTrace Node: S001\nError Mode: R.2\nReason: test",
-                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2,
+                 "reasoning_tokens": 0, "finish_reason": "stop"},
             )
 
         args = SimpleNamespace(
@@ -189,4 +200,6 @@ class CanonicalPgTimingTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIsNone(first_result["error"])
         self.assertIsNone(second_result["error"])
+        self.assertEqual(first_result["finish_reason"], "stop")
+        self.assertEqual(second_result["reasoning_tokens"], 0)
         self.assertLess(second_result["duration_s"], 0.2)
