@@ -7,6 +7,10 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from .dag_blade import METHOD as DAG_BLADE_METHOD
+from .prompts import load_taxonomy
+from .summarize_canonical_pg import mode_macro_f1
+
 
 AXES = ("actor", "when", "mode", "all")
 
@@ -90,10 +94,150 @@ def paired_axis(baseline: dict[str, dict[str, Any]], graph: dict[str, dict[str, 
     }
 
 
+def expected_trace_ids(path: Path | None) -> set[str] | None:
+    if path is None:
+        return None
+    with path.open(encoding="utf-8") as handle:
+        return {line.strip() for line in handle if line.strip() and not line.startswith("#")}
+
+
+def _method_summary(rows: list[dict[str, Any]], taxonomy_codes: tuple[str, ...]) -> dict[str, Any]:
+    metrics: dict[str, Any] = {axis: metric(rows, axis) for axis in AXES}
+    if taxonomy_codes:
+        metrics["mode_macro_f1"] = mode_macro_f1(rows, taxonomy_codes)
+    return {
+        "protocols": sorted({row.get("protocol", "unknown") for row in rows}),
+        "methods": sorted({row.get("method", "canonical") for row in rows}),
+        "records": len(rows),
+        "metrics": metrics,
+        "by_benchmark": grouped_metrics(rows, lambda row: row.get("benchmark")),
+        "by_framework": grouped_metrics(rows, lambda row: row.get("framework")),
+        "usage": {
+            key: sum((row.get("usage") or {}).get(key) or 0 for row in rows)
+            for key in ("input_tokens", "output_tokens", "total_tokens")
+        },
+        "visible_outputs": sum(bool(row.get("raw_output")) for row in rows),
+    }
+
+
+def build_comparison(
+    baseline: dict[str, dict[str, Any]],
+    graph: dict[str, dict[str, Any]],
+    *,
+    blade: dict[str, dict[str, Any]] | None = None,
+    expected_ids: set[str] | None = None,
+    taxonomy_codes: tuple[str, ...] = (),
+) -> dict[str, Any]:
+    runs = {"all_at_once": baseline, "dag": graph}
+    if blade is not None:
+        runs["dag_blade"] = blade
+    reference_ids = set(baseline)
+    for name, indexed in runs.items():
+        if not indexed or set(indexed) != reference_ids:
+            raise ValueError(
+                f"paired trace IDs differ for {name}: expected={len(reference_ids)} "
+                f"actual={len(indexed)} missing={len(reference_ids - set(indexed))} "
+                f"extra={len(set(indexed) - reference_ids)}"
+            )
+    if expected_ids is not None and reference_ids != expected_ids:
+        raise ValueError(
+            f"trace IDs differ from expected manifest: expected={len(expected_ids)} "
+            f"actual={len(reference_ids)} missing={len(expected_ids - reference_ids)} "
+            f"extra={len(reference_ids - expected_ids)}"
+        )
+
+    expected_methods = {"all_at_once": "canonical", "dag": "graph", "dag_blade": DAG_BLADE_METHOD}
+    for name, indexed in runs.items():
+        if any(row.get("method", "canonical") != expected_methods[name] for row in indexed.values()):
+            raise ValueError(f"{name} result directory contains unexpected method rows")
+    for trace_id in reference_ids:
+        gold = baseline[trace_id].get("canonical_ground_truth")
+        for name, indexed in runs.items():
+            if indexed[trace_id].get("canonical_ground_truth") != gold:
+                raise ValueError(f"hidden canonical labels differ for {name} at {trace_id}")
+
+    ordered = {
+        name: [indexed[key] for key in sorted(indexed)]
+        for name, indexed in runs.items()
+    }
+    methods = {
+        name: _method_summary(rows, taxonomy_codes)
+        for name, rows in ordered.items()
+    }
+    pairs = [("all_at_once", "dag")]
+    if blade is not None:
+        pairs.extend([("all_at_once", "dag_blade"), ("dag", "dag_blade")])
+    pairwise: dict[str, Any] = {}
+    for left_name, right_name in pairs:
+        key = f"{left_name}_vs_{right_name}"
+        left, right = runs[left_name], runs[right_name]
+        pairwise[key] = {
+            "left_method": left_name,
+            "right_method": right_name,
+            "metrics": {axis: paired_axis(left, right, axis) for axis in AXES},
+        }
+        if taxonomy_codes:
+            left_f1 = methods[left_name]["metrics"]["mode_macro_f1"]["macro_f1"]
+            right_f1 = methods[right_name]["metrics"]["mode_macro_f1"]["macro_f1"]
+            pairwise[key]["mode_macro_f1_delta"] = right_f1 - left_f1
+
+    result = {
+        "records": len(reference_ids),
+        "expected_trace_ids_verified": expected_ids is not None,
+        "methods": methods,
+        "pairwise_metrics": pairwise,
+        # Preserve the original two-method keys for existing consumers.
+        "baseline_protocols": methods["all_at_once"]["protocols"],
+        "graph_protocols": methods["dag"]["protocols"],
+        "paired_metrics": pairwise["all_at_once_vs_dag"]["metrics"],
+        "by_benchmark": {
+            "baseline": methods["all_at_once"]["by_benchmark"],
+            "graph": methods["dag"]["by_benchmark"],
+        },
+        "by_framework": {
+            "baseline": methods["all_at_once"]["by_framework"],
+            "graph": methods["dag"]["by_framework"],
+        },
+        "by_error_mode": {
+            "baseline": grouped_metrics(
+                ordered["all_at_once"],
+                lambda row: (row.get("canonical_ground_truth") or {}).get("mode"),
+            ),
+            "graph": grouped_metrics(
+                ordered["dag"],
+                lambda row: (row.get("canonical_ground_truth") or {}).get("mode"),
+            ),
+        },
+        "usage": {
+            "baseline": methods["all_at_once"]["usage"],
+            "graph": methods["dag"]["usage"],
+        },
+        "visible_outputs": {
+            "baseline": methods["all_at_once"]["visible_outputs"],
+            "graph": methods["dag"]["visible_outputs"],
+        },
+    }
+    if blade is not None:
+        result["by_benchmark"]["dag_blade"] = methods["dag_blade"]["by_benchmark"]
+        result["by_framework"]["dag_blade"] = methods["dag_blade"]["by_framework"]
+        result["by_error_mode"]["dag_blade"] = grouped_metrics(
+            ordered["dag_blade"],
+            lambda row: (row.get("canonical_ground_truth") or {}).get("mode"),
+        )
+        result["usage"]["dag_blade"] = methods["dag_blade"]["usage"]
+        result["visible_outputs"]["dag_blade"] = methods["dag_blade"]["visible_outputs"]
+    return result
+
+
 def build_argparser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--baseline", required=True, type=Path, help="Merged baseline result directory")
     parser.add_argument("--graph", required=True, type=Path, help="Merged graph result directory")
+    parser.add_argument("--blade", type=Path, help="Merged DAG+BLADE result directory")
+    parser.add_argument("--expected-trace-id-file", type=Path,
+                        help="Optional exact trace ID manifest required for full-run comparisons")
+    parser.add_argument("--taxonomy-path", type=Path,
+                        help="taxonomy.yaml; required to report 17-class macro-F1")
     parser.add_argument("--out", required=True, type=Path, help="Output JSON path")
     return parser
 
@@ -102,53 +246,21 @@ def main(argv: list[str] | None = None) -> int:
     args = build_argparser().parse_args(argv)
     baseline = read_rows(args.baseline)
     graph = read_rows(args.graph)
-    if not baseline or set(baseline) != set(graph):
-        raise ValueError(
-            f"paired trace IDs differ: baseline={len(baseline)} graph={len(graph)} "
-            f"missing={len(set(baseline) - set(graph))} extra={len(set(graph) - set(baseline))}"
-        )
-    if any(row.get("method", "canonical") != "canonical" for row in baseline.values()):
-        raise ValueError("baseline directory contains non-canonical rows")
-    if any(row.get("method") != "graph" for row in graph.values()):
-        raise ValueError("graph directory contains non-graph rows")
-    for trace_id in baseline:
-        if baseline[trace_id].get("canonical_ground_truth") != graph[trace_id].get("canonical_ground_truth"):
-            raise ValueError(f"hidden canonical labels differ between runs at {trace_id}")
-
-    base_rows = [baseline[key] for key in sorted(baseline)]
-    graph_rows = [graph[key] for key in sorted(graph)]
-    comparison = {
-        "records": len(baseline),
-        "baseline_protocols": sorted({row.get("protocol", "unknown") for row in base_rows}),
-        "graph_protocols": sorted({row.get("protocol", "unknown") for row in graph_rows}),
-        "paired_metrics": {axis: paired_axis(baseline, graph, axis) for axis in AXES},
-        "by_benchmark": {
-            "baseline": grouped_metrics(base_rows, lambda row: row.get("benchmark")),
-            "graph": grouped_metrics(graph_rows, lambda row: row.get("benchmark")),
-        },
-        "by_framework": {
-            "baseline": grouped_metrics(base_rows, lambda row: row.get("framework")),
-            "graph": grouped_metrics(graph_rows, lambda row: row.get("framework")),
-        },
-        "by_error_mode": {
-            "baseline": grouped_metrics(base_rows, lambda row: (row.get("canonical_ground_truth") or {}).get("mode")),
-            "graph": grouped_metrics(graph_rows, lambda row: (row.get("canonical_ground_truth") or {}).get("mode")),
-        },
-        "usage": {
-            "baseline": {key: sum((row.get("usage") or {}).get(key) or 0 for row in base_rows)
-                          for key in ("input_tokens", "output_tokens", "total_tokens")},
-            "graph": {key: sum((row.get("usage") or {}).get(key) or 0 for row in graph_rows)
-                      for key in ("input_tokens", "output_tokens", "total_tokens")},
-        },
-        "visible_outputs": {
-            "baseline": sum(bool(row.get("raw_output")) for row in base_rows),
-            "graph": sum(bool(row.get("raw_output")) for row in graph_rows),
-        },
-    }
+    blade = read_rows(args.blade) if args.blade else None
+    taxonomy_codes: tuple[str, ...] = ()
+    if args.taxonomy_path:
+        taxonomy_codes = load_taxonomy(args.taxonomy_path.parent).codes
+    if blade is not None and not taxonomy_codes:
+        raise ValueError("--taxonomy-path is required with --blade for canonical macro-F1")
+    comparison = build_comparison(
+        baseline, graph, blade=blade,
+        expected_ids=expected_trace_ids(args.expected_trace_id_file),
+        taxonomy_codes=taxonomy_codes,
+    )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(comparison, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
                          encoding="utf-8")
-    print(json.dumps(comparison["paired_metrics"], ensure_ascii=False, indent=2))
+    print(json.dumps(comparison["pairwise_metrics"], ensure_ascii=False, indent=2))
     print(f"wrote {args.out}")
     return 0
 

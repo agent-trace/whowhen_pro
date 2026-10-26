@@ -89,6 +89,10 @@ python -m whowhen_eval.run --model gpt-5.4 --data-root ./whowhen-pro \
 
 The separate [DAG Backtrace runner](docs/dag-backtrace-pg.md) reads the lossless text trajectories from PostgreSQL, constructs semantic dependency graphs, and follows them backwards to attribute failures. Preview the PG adapter and label-safety checks without model calls with `python -m whowhen_eval.run_dag_pg --model <model> --canonical-snapshot <labels.jsonl> --pg-dsn <dsn> --max-traces 3 --dry-run`.
 
+### BLADE-inspired DAG+BLADE experiment
+
+The experimental BLADE-inspired runner is separate from the DAG baseline and uses the same PostgreSQL trace adapter and canonical scorer. See the [BLADE code and report guide](docs/dag-blade-code-and-reports.md) for module ownership, the full-run results, and the three-method comparison. The runner help is available with `python -m whowhen_eval.run_dag_blade_pg --help`. This is a DeepSeek-compatible adaptation, not an exact reproduction of BLADE/Jev.
+
 See the [full-text All-at-Once run report](docs/full-text-all-at-once-report.md) for the JSONL and PostgreSQL-backed full runs, token usage, scores, and paper-comparison caveats.
 
 ## 📈 Check the Metrics
